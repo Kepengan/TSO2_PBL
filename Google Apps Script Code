@@ -1,0 +1,193 @@
+// =====================================================
+// RECEIVE SENSOR DATA (Temperature, Humidity, Pressure, Distance)
+// =====================================================
+function doGet(e) { return handleResponse(e); }
+function doPost(e) { return handleResponse(e); }
+
+function handleResponse(e) {
+  var lock = LockService.getScriptLock();
+  lock.tryLock(10000);
+
+  try {
+    var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("SensorData");
+
+    var payload;
+    if (e.postData && e.postData.contents) {
+      payload = JSON.parse(e.postData.contents);
+    } else if (e.parameter) {
+      payload = e.parameter;
+    } else {
+      return ContentService
+        .createTextOutput(JSON.stringify({ status: 'error', message: 'No data received' }))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+
+    var timestamp = new Date();
+    var data = [
+      timestamp,
+      parseFloat(payload.temperature) || "",
+      parseFloat(payload.humidity) || "",
+      parseFloat(payload.pressure_atm) || "",
+      parseFloat(payload.distance) || ""
+    ];
+
+    sheet.appendRow(data);
+
+    return ContentService
+      .createTextOutput(JSON.stringify({ status: "success", timestamp: timestamp.toString() }))
+      .setMimeType(ContentService.MimeType.JSON);
+
+  } catch (error) {
+    return ContentService
+      .createTextOutput(JSON.stringify({ status: "error", message: error.toString() }))
+      .setMimeType(ContentService.MimeType.JSON);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// =====================================================
+// FORECAST ALL SENSORS (ONE CLICK)
+// =====================================================
+function generateAllForecasts() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName("SensorData");
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return;
+
+  // Sensor mapping
+  var sensors = {
+    "temperature": 2,
+    "humidity": 3,
+    "pressure_atm": 4,
+    "distance": 5
+  };
+
+  // Historical values
+  var sensorValues = {};
+  Object.keys(sensors).forEach(sensor => {
+    sensorValues[sensor] = sheet.getRange(2, sensors[sensor], lastRow - 1, 1)
+                               .getValues()
+                               .flat()
+                               .filter(x => x !== "" && !isNaN(x));
+  });
+
+  // Create or open Forecast sheet
+  var forecastSheet = ss.getSheetByName("Forecasts");
+  if (!forecastSheet) {
+    forecastSheet = ss.insertSheet("Forecasts");
+    // Header row
+    var header = ["Timestamp"];
+    Object.keys(sensors).forEach(sensor => {
+      header.push(sensor + " Forecast", sensor + " Upper", sensor + " Lower");
+    });
+    forecastSheet.appendRow(header);
+  }
+
+  // Determine starting timestamp
+  var forecastLastRow = forecastSheet.getLastRow();
+  var startTimestamp;
+  if (forecastLastRow > 1) {
+    // Get the last forecast timestamp
+    startTimestamp = new Date(forecastSheet.getRange(forecastLastRow, 1).getValue());
+  } else {
+    // No forecast yet, use last SensorData timestamp
+    var timestamps = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
+    startTimestamp = new Date(timestamps[timestamps.length - 1]);
+  }
+
+  // Forecast parameters
+  var alpha = 0.3, beta = 0.1, gamma = 0.1, seasonLength = 24;
+  var forecastLength = 24;
+
+  // Forecast each sensor separately
+  var forecasts = {};
+  Object.keys(sensorValues).forEach(sensor => {
+    forecasts[sensor] = calculateHoltWintersForecast(sensorValues[sensor], startTimestamp, alpha, beta, gamma, seasonLength, forecastLength);
+  });
+
+  // Append 24 forecast rows
+  for (var h = 0; h < forecastLength; h++) {
+    var row = [];
+    row.push(forecasts["temperature"][h].timestamp);
+    Object.keys(sensors).forEach(sensor => {
+      row.push(
+        forecasts[sensor][h].forecastValue.toFixed(2),
+        forecasts[sensor][h].upperBound.toFixed(2),
+        forecasts[sensor][h].lowerBound.toFixed(2)
+      );
+    });
+    forecastSheet.appendRow(row);
+  }
+
+  SpreadsheetApp.getUi().alert("All forecasts generated in single sheet!");
+}
+
+// =====================================================
+// HOLT-WINTERS FORECAST FUNCTION
+// =====================================================
+function calculateHoltWintersForecast(values, lastTimestamp, alpha, beta, gamma, m, forecastLength) {
+  var seasonals = [];
+  var initialSeasonAverage = average(values.slice(0, m));
+
+  for (var i = 0; i < m; i++) {
+    seasonals.push(values[i] - initialSeasonAverage);
+  }
+
+  var level = values[0];
+  var trend = values[1] - values[0];
+
+  for (var t = 0; t < values.length; t++) {
+    var val = values[t];
+    var seasonalIndex = t % m;
+    var lastLevel = level;
+
+    level = alpha * (val - seasonals[seasonalIndex]) + (1 - alpha) * (level + trend);
+    trend = beta * (level - lastLevel) + (1 - beta) * trend;
+    seasonals[seasonalIndex] = gamma * (val - level) + (1 - gamma) * seasonals[seasonalIndex];
+  }
+
+  var output = [];
+  for (var h = 1; h <= forecastLength; h++) {
+    var nextTime = new Date(lastTimestamp.getTime() + h * 60 * 60 * 1000);
+    var forecastValue = level + h * trend + seasonals[(values.length + h - 1) % m];
+
+    output.push({
+      timestamp: nextTime,
+      forecastValue: forecastValue,
+      upperBound: forecastValue * 1.10,
+      lowerBound: forecastValue * 0.90
+    });
+  }
+
+  return output;
+}
+
+// =====================================================
+// HELPER FUNCTION: AVERAGE
+// =====================================================
+function average(arr) {
+  var sum = arr.reduce((a,b) => a+b, 0);
+  return sum / arr.length;
+}
+
+// =====================================================
+// MENU BUTTONS
+// =====================================================
+function onOpen() {
+  var ui = SpreadsheetApp.getUi();
+  ui.createMenu('Sensor Data')
+    .addItem('Forecast ALL Sensors', 'generateAllForecasts')
+    .addItem('Clear All Data', 'clearData')
+    .addToUi();
+}
+
+// =====================================================
+// CLEAR RAW DATA
+// =====================================================
+function clearData() {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("SensorData");
+  var lastRow = sheet.getLastRow();
+  if (lastRow > 1) sheet.deleteRows(2, lastRow - 1);
+  SpreadsheetApp.getUi().alert("SensorData cleared successfully!");
+}
